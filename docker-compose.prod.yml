@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # In prod meestal NIET publiceren; lokaal mag het voor debugging.
+    # Verwijder deze "ports" zodra je echt prod simuleert.
+    ports:
+      - "5432:5432"
+
+  web:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DJANGO_SETTINGS_MODULE: config.settings
+      DEBUG: "0"
+      # Voor local prod-test
+      ALLOWED_HOSTS: "localhost,127.0.0.1"
+      # DB host is service-naam
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    # Geen volumes/bind mounts in prod
+    # volumes:  <-- bewust weg
+    #   - ./app:/app
+
+volumes:
+  postgres_data:

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Food Chatbot</title>
+  </head>
+  <body>
+    <h1>Chatbot: 3 favourite foods</h1>
+
+    <p>Enter your favourite foods (free text). The API will extract exactly three if possible.</p>
+
+    <textarea id="foods" rows="4" cols="60" placeholder="e.g. sushi, pizza, ramen"></textarea>
+    <br />
+    <button id="send">Send</button>
+
+    <h2>Response</h2>
+    <pre id="out"></pre>
+
+    <script>
+      const btn = document.getElementById("send");
+      const out = document.getElementById("out");
+
+      btn.addEventListener("click", async () => {
+        out.textContent = "Calling API...";
+        const foods = document.getElementById("foods").value;
+
+        try {
+          const r = await fetch("{% url 'ask_foods' %}", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ foods }),
+          });
+
+          const text = await r.text(); // read raw first (allows better error display)
+
+          if (!r.ok) {
+            out.textContent = `HTTP ${r.status}\n\n${text}`;
+            return;
+          }
+
+          const data = JSON.parse(text);
+          out.textContent = JSON.stringify(data, null, 2);
+        } catch (err) {
+          out.textContent = `Client error: ${err}`;
+        }
+      });
+    </script>
+  </body>
+</html>

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.env
+
+# Django
+db.sqlite3
+staticfiles/
+*.log
+
+# Docker
+*.log
+
+# VSCode
+.vscode/
+
+# Mac
+.DS_Store
+
+#Gunicorn
+gunicorn.ctl
+*.ctl
