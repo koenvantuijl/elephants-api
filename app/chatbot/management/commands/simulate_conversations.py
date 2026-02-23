@@ -3,6 +3,7 @@ import json
 import time
 import random
 import re
+from typing import Tuple, List, Dict
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
@@ -31,40 +32,98 @@ CUSTOMER_SYSTEM = (
 MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
+# -----------------------------------------------------------------------------
+# Dietary label sampling (controlled distribution)
+# -----------------------------------------------------------------------------
 def sample_label(rng: random.Random) -> str:
     """
     Sample a dietary label with a controlled distribution to guarantee that
     vegetarian/vegan customers occur in the simulated dataset.
     """
     r = rng.random()
-    if r < 0.15:
+    if r < 0.02:
         return "vegan"
-    if r < 0.35:
+    if r < 0.2:
         return "vegetarian"
     return "omnivore"
 
 
+# -----------------------------------------------------------------------------
+# Prompt injection to force a STRICT foods format
+# -----------------------------------------------------------------------------
 def inject_customer_system_with_label(base_system: str, label: str) -> str:
     """
-    Condition the customer agent on a predetermined dietary label and enforce
-    a deterministic, machine-detectable tag in the "top 3 foods" answer.
+    Enforce a strict, machine-parseable format ONLY for the "top 3 favourite foods" answer.
 
-    The tag is appended exactly once to the foods answer:
+    Required format:
+      FOOD_1, FOOD_2, FOOD_3
       DIETARY_LABEL=<label>
+
+    All other turns: natural language is allowed.
     """
     return (
         base_system
         + "\n\n"
-        + "IMPORTANT CONSTRAINTS:\n"
-          f"- You are strictly '{label}'.\n"
-          "- When you answer the question about your top 3 favourite foods, you MUST append exactly once at the end:\n"
-          f"  DIETARY_LABEL={label}\n"
-          "- Do not include any other dietary label tags.\n"
-          "- All answers must remain plain natural language (no JSON).\n"
+        + "IMPORTANT CONSTRAINTS (STRICT):\n"
+        + f"- You are strictly '{label}'.\n"
+        + "- When asked about your top 3 favourite foods, you MUST reply in EXACTLY this format:\n"
+        + "  FOOD_1, FOOD_2, FOOD_3\n"
+        + f"  DIETARY_LABEL={label}\n"
+        + "- The first line must contain exactly three foods separated by commas.\n"
+        + "- Do NOT add any extra words (no sentences, no politeness, no explanations).\n"
+        + "- Do NOT include ordering wishes in that answer.\n"
+        + "- For all other questions, answer normally in plain natural language.\n"
     )
 
 
-def call_agent(client: OpenAI, system: str, transcript: list[dict]) -> str:
+def parse_favorite_foods_strict(customer_answer: str) -> Tuple[List[str], str]:
+    """
+    Parse the STRICT format:
+      FOOD_1, FOOD_2, FOOD_3
+      DIETARY_LABEL=<label>
+
+    Raises ValueError on non-conforming answers.
+    """
+    text = (customer_answer or "").strip()
+
+    m = re.search(
+        r"\bDIETARY_LABEL\s*=\s*(omnivore|vegetarian|vegan)\b",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        raise ValueError("Missing DIETARY_LABEL tag.")
+    label = m.group(1).lower()
+
+    before = text[: m.start()].strip()
+    lines = [ln.strip() for ln in before.splitlines() if ln.strip()]
+    if not lines:
+        raise ValueError("Missing foods line before DIETARY_LABEL.")
+    foods_line = lines[0]
+
+    parts = [p.strip(" \t\r\n.,;:!?'\"") for p in foods_line.split(",")]
+    parts = [p for p in parts if p]
+    if len(parts) != 3:
+        raise ValueError(f"Expected exactly 3 comma-separated foods, got {len(parts)}.")
+
+    bad_tokens = (" i would ", " i'd ", " order ", " please", " want to ", " like to ","great choice")
+    for f in parts:
+        low = f.lower()
+        if any(t in low for t in bad_tokens):
+            raise ValueError("Foods contain sentence-like/order-like text.")
+        if len(f) > 40:
+            raise ValueError("Food item too long, likely not a food name.")
+
+    if len({p.lower() for p in parts}) != 3:
+        raise ValueError("Foods must be three different items.")
+
+    return parts, label
+
+
+# -----------------------------------------------------------------------------
+# OpenAI call wrapper
+# -----------------------------------------------------------------------------
+def call_agent(client: OpenAI, system: str, transcript: List[Dict]) -> str:
     conv_text = ""
     for m in transcript:
         conv_text += f"{m['role'].upper()}: {m['content']}\n"
@@ -79,7 +138,10 @@ def call_agent(client: OpenAI, system: str, transcript: list[dict]) -> str:
     return (resp.output_text or "").strip()
 
 
-def extract_foods_and_label(client: OpenAI, customer_answer: str) -> tuple[list[str], str]:
+# -----------------------------------------------------------------------------
+# Robust extraction fallback (kept as a safety net)
+# -----------------------------------------------------------------------------
+def extract_foods_and_label(client: OpenAI, customer_answer: str) -> Tuple[List[str], str]:
     """
     Robust extraction of:
       - dietary_label ∈ {omnivore, vegetarian, vegan}
@@ -125,7 +187,7 @@ def extract_foods_and_label(client: OpenAI, customer_answer: str) -> tuple[list[
             return label
         return "omnivore"
 
-    def _validate(data: dict) -> tuple[list[str], str]:
+    def _validate(data: dict) -> Tuple[List[str], str]:
         foods = data.get("favorite_foods", [])
         raw_label = tag_label or data.get("dietary_label", "omnivore")
         label = _normalize_label(raw_label)
@@ -139,7 +201,7 @@ def extract_foods_and_label(client: OpenAI, customer_answer: str) -> tuple[list[
 
         return foods, label
 
-    def _fallback_from_text(answer: str) -> tuple[list[str], str]:
+    def _fallback_from_text(answer: str) -> Tuple[List[str], str]:
         a = (answer or "").strip()
         low = a.lower()
 
@@ -232,13 +294,16 @@ def extract_foods_and_label(client: OpenAI, customer_answer: str) -> tuple[list[
     return _fallback_from_text(customer_answer)
 
 
-def _dedupe_and_fill_three(foods: list[str]) -> list[str]:
+# -----------------------------------------------------------------------------
+# Data hygiene helpers
+# -----------------------------------------------------------------------------
+def _dedupe_and_fill_three(foods: List[str]) -> List[str]:
     """
     Ensure exactly 3 non-empty, unique foods (case-insensitive). If fewer than 3
     after deduplication, fill deterministically from a small fallback list.
     """
     seen = set()
-    out: list[str] = []
+    out: List[str] = []
     for f in foods or []:
         s = str(f).strip()
         if not s:
@@ -262,6 +327,42 @@ def _dedupe_and_fill_three(foods: list[str]) -> list[str]:
     return out[:3]
 
 
+def _looks_like_order_text(s: str) -> bool:
+    """
+    Heuristic: detect order-like sentences rather than a foods list.
+    """
+    t = (s or "").lower()
+    patterns = [
+        r"\bi would like to order\b",
+        r"\bcan i (get|have|order)\b",
+        r"\b(i('| a)m|im) going to have\b",
+        r"\border\b",
+        r"\bdish(es)?\b",
+        r"\bfor (my|our) (main|starter|dessert)\b",
+    ]
+    return any(re.search(p, t) for p in patterns)
+
+
+def _force_foods_answer(client: OpenAI, customer_system: str, transcript: List[Dict], target_label: str) -> str:
+    """
+    One repair turn: force a strict foods-only answer to avoid parsing pollution.
+    """
+    repair_system = (
+        customer_system
+        + "\n\n"
+        + "REPAIR MODE (strict):\n"
+          "- Your next reply MUST contain ONLY your top 3 favourite foods.\n"
+          "- Format exactly:\n"
+          "  FOOD_1, FOOD_2, FOOD_3\n"
+          f"  DIETARY_LABEL={target_label}\n"
+          "- Do NOT mention ordering, dishes, restaurants, or any extra words.\n"
+    )
+    return call_agent(client, repair_system, transcript)
+
+
+# -----------------------------------------------------------------------------
+# Indexing helper to avoid overwriting customers across batches
+# -----------------------------------------------------------------------------
 def _next_customer_index() -> int:
     """
     Compute the next available integer index for customer_code CUST_###.
@@ -311,10 +412,10 @@ class Command(BaseCommand):
 
         client = OpenAI(api_key=api_key)
 
-        n = opts["n"]
-        pause = opts["sleep"]
-        seed = opts["seed"]
-        start_arg = opts["start"]
+        n = int(opts["n"])
+        pause = float(opts["sleep"])
+        seed = int(opts["seed"])
+        start_arg = int(opts["start"])
 
         # Determine start index BEFORE initializing RNG
         start_idx = start_arg if start_arg and start_arg > 0 else _next_customer_index()
@@ -337,9 +438,10 @@ class Command(BaseCommand):
 
                 conversation = SimulatedConversation.objects.create(customer=customer)
 
-                transcript: list[dict] = []
+                transcript: List[Dict] = []
                 turn = 1
 
+                # Turn 1: waiter
                 waiter_1 = call_agent(client, WAITER_SYSTEM, transcript)
                 SimulatedMessage.objects.create(
                     conversation=conversation, role="waiter", content=waiter_1, turn_index=turn
@@ -347,6 +449,7 @@ class Command(BaseCommand):
                 transcript.append({"role": "assistant", "content": waiter_1})
                 turn += 1
 
+                # Turn 2: customer day summary
                 customer_1 = call_agent(client, customer_system, transcript)
                 SimulatedMessage.objects.create(
                     conversation=conversation, role="customer", content=customer_1, turn_index=turn
@@ -355,6 +458,7 @@ class Command(BaseCommand):
                 customer.day_summary = customer_1[:5000]
                 turn += 1
 
+                # Turn 3: waiter asks foods
                 waiter_2 = call_agent(client, WAITER_SYSTEM, transcript)
                 SimulatedMessage.objects.create(
                     conversation=conversation, role="waiter", content=waiter_2, turn_index=turn
@@ -362,6 +466,7 @@ class Command(BaseCommand):
                 transcript.append({"role": "assistant", "content": waiter_2})
                 turn += 1
 
+                # Turn 4: customer answers foods (STRICT expected)
                 customer_2 = call_agent(client, customer_system, transcript)
                 SimulatedMessage.objects.create(
                     conversation=conversation, role="customer", content=customer_2, turn_index=turn
@@ -369,14 +474,40 @@ class Command(BaseCommand):
                 transcript.append({"role": "user", "content": customer_2})
                 turn += 1
 
-                foods, parsed_label = extract_foods_and_label(client, customer_2)
-                foods = _dedupe_and_fill_three(foods)
+                # Prefer strict parsing; if it fails, do one repair turn; then fallback extraction.
+                foods: List[str]
+                try:
+                    foods, parsed_label = parse_favorite_foods_strict(customer_2)
+                except Exception:
+                    # If the model accidentally answered with an order-like sentence or extra text: repair once.
+                    if _looks_like_order_text(customer_2):
+                        self.stderr.write(f"[WARN] {cust_code}: foods answer looked like an order; forcing repair.")
+                    else:
+                        self.stderr.write(f"[WARN] {cust_code}: strict parse failed; forcing repair.")
+
+                    customer_2b = _force_foods_answer(client, customer_system, transcript, target_label)
+                    SimulatedMessage.objects.create(
+                        conversation=conversation, role="customer", content=customer_2b, turn_index=turn
+                    )
+                    transcript.append({"role": "user", "content": customer_2b})
+                    turn += 1
+
+                    try:
+                        foods, parsed_label = parse_favorite_foods_strict(customer_2b)
+                    except Exception:
+                        foods, parsed_label = extract_foods_and_label(client, customer_2b)
+                        foods = _dedupe_and_fill_three(foods)
+                    else:
+                        foods = _dedupe_and_fill_three(foods)
+                else:
+                    foods = _dedupe_and_fill_three(foods)
 
                 # Enforce predetermined label (avoid drift; guarantees cohort distribution)
                 customer.favorite_foods = foods
                 customer.dietary_label = target_label
                 customer.save(update_fields=["day_summary", "favorite_foods", "dietary_label"])
 
+                # Turn 5: waiter asks order
                 waiter_3 = call_agent(client, WAITER_SYSTEM, transcript)
                 SimulatedMessage.objects.create(
                     conversation=conversation, role="waiter", content=waiter_3, turn_index=turn
@@ -384,6 +515,7 @@ class Command(BaseCommand):
                 transcript.append({"role": "assistant", "content": waiter_3})
                 turn += 1
 
+                # Turn 6: customer orders
                 customer_3 = call_agent(client, customer_system, transcript)
                 SimulatedMessage.objects.create(
                     conversation=conversation, role="customer", content=customer_3, turn_index=turn

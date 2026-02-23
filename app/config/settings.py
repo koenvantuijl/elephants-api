@@ -21,6 +21,11 @@ ALLOWED_HOSTS = [
 ]
 ALLOWED_HOSTS = [h for h in ALLOWED_HOSTS if h]
 
+
+
+
+
+
 # =============================================================================
 # Applications
 # =============================================================================
@@ -80,25 +85,29 @@ TEMPLATES = [
 # =============================================================================
 # Database (Postgres)
 # =============================================================================
-if os.getenv("USE_SQLITE", "0") == "1":
+USE_SQLITE = os.getenv("USE_SQLITE", "0") == "1"
+
+if USE_SQLITE:
+    SQLITE_PATH = os.getenv("SQLITE_PATH", "/home/site/db.sqlite3")
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
-            "NAME": "/tmp/db.sqlite3",
+            "NAME": SQLITE_PATH,
+            "OPTIONS": {
+                "timeout": 20,  # seconds; reduce "database is locked" issues
+            },
         }
     }
 else:
-    DATABASES = {
-        "default": {
-            "ENGINE": "django.db.backends.postgresql",
-            "NAME": os.getenv("POSTGRES_DB"),
-            "USER": os.getenv("POSTGRES_USER"),
-            "PASSWORD": os.getenv("POSTGRES_PASSWORD"),
-            "HOST": os.getenv("POSTGRES_HOST"),
-            "PORT": os.getenv("POSTGRES_PORT", "5432"),
-        }
-    }
+    import dj_database_url
 
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is required when USE_SQLITE=0")
+
+    DATABASES = {
+        "default": dj_database_url.parse(database_url, conn_max_age=60)
+    }
 # =============================================================================
 # Internationalization
 # =============================================================================
