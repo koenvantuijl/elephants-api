@@ -2,7 +2,7 @@ import os
 import time
 import random
 import re
-from typing import Tuple, List, Dict
+from typing import List, Dict
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
@@ -32,7 +32,26 @@ MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 # -----------------------------------------------------------------------------
-# Dietary label sampling (controlled distribution)
+# OpenAI call helper (YOU WERE MISSING THIS)
+# -----------------------------------------------------------------------------
+def call_agent(client: OpenAI, system: str, transcript: List[Dict], turn_instruction: str = "") -> str:
+    conv_text = ""
+    for m in transcript:
+        conv_text += f"{m['role'].upper()}: {m['content']}\n"
+
+    prompt = (
+        f"{system}\n"
+        f"{turn_instruction}\n\n"
+        f"Conversation so far:\n{conv_text}\n\n"
+        "Your next reply:"
+    )
+
+    resp = client.responses.create(model=MODEL, input=prompt)
+    return (resp.output_text or "").strip()
+
+
+# -----------------------------------------------------------------------------
+# Dietary label sampling
 # -----------------------------------------------------------------------------
 def sample_label(rng: random.Random) -> str:
     r = rng.random()
@@ -44,7 +63,7 @@ def sample_label(rng: random.Random) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Keep label fixed, keep conversation natural (no strict foods format)
+# Keep label fixed
 # -----------------------------------------------------------------------------
 def inject_customer_system_with_label(base_system: str, label: str) -> str:
     return (
@@ -58,78 +77,86 @@ def inject_customer_system_with_label(base_system: str, label: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Parse three foods from natural language (simple heuristic)
+# Robust natural parser
 # -----------------------------------------------------------------------------
 def parse_three_foods_natural(text: str) -> List[str]:
-    """
-    Extract exactly 3 foods from a natural-language answer.
-    More robust against sentences like:
-      "Sure! I really love pasta with tomato sauce, ..."
-    """
     s = (text or "").strip()
     if not s:
         raise ValueError("Empty foods answer")
 
-    # -------------------------------------------------
-    # 1. Remove common leading phrases
-    # -------------------------------------------------
+    # normalize unicode punctuation (I’d -> I'd)
+    s = (
+        s.replace("\u2019", "'")
+         .replace("\u2018", "'")
+         .replace("\u201c", '"')
+         .replace("\u201d", '"')
+    )
+
+    # remove common leading phrases
+    s = re.sub(r"^(sure!?|yeah!?|yes!?|well,?|honestly,?)\s*", "", s, flags=re.I)
+    s = re.sub(r"^i(?:'d| would)\s+say\s+", "", s, flags=re.I)
     s = re.sub(
-        r"^(sure!?|yeah!?|yes!?|of course!?|well,?|honestly,?)\s*",
+        r"^(?:i(?:'d| would)\s+say\s+)?my\s+(?:top\s+)?(?:three\s+)?"
+        r"(?:favorite|favourite)\s+foods\s+(?:are|would be)\s+",
         "",
         s,
         flags=re.I,
     )
+    s = re.sub(r"^(i (really )?(love|like|enjoy))\s+", "", s, flags=re.I)
 
-    s = re.sub(
-        r"^(i (really )?(love|like|enjoy|would say|d say|usually like))\s+",
-        "",
-        s,
-        flags=re.I,
-    )
+    # remove "of course" globally
+    s = re.sub(r"\bof course\b,?\s*", "", s, flags=re.I)
 
-    s = re.sub(
-        r"^(my (top )?(three )?(favorite|favourite) foods (are|would be))\s+",
-        "",
-        s,
-        flags=re.I,
-    )
-
-    # -------------------------------------------------
-    # 2. Normalize separators
-    # -------------------------------------------------
+    # normalize separators
     s_norm = (
         s.replace(" and ", ", ")
-        .replace(" & ", ", ")
-        .replace(";", ", ")
-        .replace("/", ", ")
-        .replace("\n", ", ")
+         .replace(" & ", ", ")
+         .replace(";", ", ")
+         .replace("/", ", ")
+         .replace("\n", ", ")
     )
 
     parts = [p.strip(" \t\r\n.,;:!?'\"") for p in s_norm.split(",")]
     parts = [p for p in parts if p]
 
-    # -------------------------------------------------
-    # 3. Clean each candidate
-    # -------------------------------------------------
+    DISCOURSE = {
+        "of course", "sure", "yeah", "yes", "certainly",
+        "definitely", "absolutely", "for sure"
+    }
+
     cleaned: List[str] = []
     seen = set()
+    MAX_LEN = 60
 
     for p in parts:
         item = p.strip()
 
-        # remove trailing sentence fragments
+        # cut trailing sentence
+        item = re.sub(r"[.!?].*$", "", item).strip()
+
+        # strip leading "a good "
+        item = re.sub(r"^a\s+good\s+", "", item, flags=re.I).strip()
+
+        # handle "X like Y"
+        low = item.lower()
+        if " like " in low:
+            item = item.split(" like ", 1)[1].strip()
+        elif " such as " in low:
+            item = item.split(" such as ", 1)[1].strip()
+
+        # remove trailing clauses
         item = re.sub(r"\b(they|which|that)\b.*$", "", item, flags=re.I).strip()
 
-        # remove leading filler words again (safety)
-        item = re.sub(
-            r"^(i (really )?(love|like|enjoy))\s+",
-            "",
-            item,
-            flags=re.I,
-        )
+        # remove filler verbs again
+        item = re.sub(r"^(i (really )?(love|like|enjoy))\s+", "", item, flags=re.I).strip()
 
-        # length guard (important!)
-        if len(item) > 40:
+        if not item:
+            continue
+
+        if item.lower() in DISCOURSE:
+            continue
+
+        if len(item) > MAX_LEN:
             continue
 
         key = item.lower()
@@ -149,26 +176,7 @@ def parse_three_foods_natural(text: str) -> List[str]:
 
 
 # -----------------------------------------------------------------------------
-# OpenAI call wrapper (simple per-turn instruction line)
-# -----------------------------------------------------------------------------
-def call_agent(client: OpenAI, system: str, transcript: List[Dict], turn_instruction: str = "") -> str:
-    conv_text = ""
-    for m in transcript:
-        conv_text += f"{m['role'].upper()}: {m['content']}\n"
-
-    prompt = (
-        f"{system}\n"
-        f"{turn_instruction}\n\n"
-        f"Conversation so far:\n{conv_text}\n\n"
-        "Your next reply:"
-    )
-
-    resp = client.responses.create(model=MODEL, input=prompt)
-    return (resp.output_text or "").strip()
-
-
-# -----------------------------------------------------------------------------
-# Indexing helper to avoid overwriting customers across batches
+# Index helper
 # -----------------------------------------------------------------------------
 def _next_customer_index() -> int:
     codes = SimulatedCustomer.objects.values_list("customer_code", flat=True)
@@ -185,6 +193,9 @@ def _next_customer_index() -> int:
     return max_idx + 1
 
 
+# -----------------------------------------------------------------------------
+# Main command
+# -----------------------------------------------------------------------------
 class Command(BaseCommand):
     help = "Simulate waiter-customer conversations and store them in the database."
 
@@ -192,15 +203,7 @@ class Command(BaseCommand):
         parser.add_argument("--n", type=int, default=100)
         parser.add_argument("--sleep", type=float, default=0.0)
         parser.add_argument("--seed", type=int, default=42)
-        parser.add_argument(
-            "--start",
-            type=int,
-            default=0,
-            help=(
-                "Optional explicit start index for customer codes (CUST_<start>...). "
-                "If 0, auto-detect next free index."
-            ),
-        )
+        parser.add_argument("--start", type=int, default=0)
 
     @transaction.atomic
     def handle(self, *args, **opts):
@@ -215,7 +218,7 @@ class Command(BaseCommand):
         seed = int(opts["seed"])
         start_arg = int(opts["start"])
 
-        start_idx = start_arg if start_arg and start_arg > 0 else _next_customer_index()
+        start_idx = start_arg if start_arg > 0 else _next_customer_index()
         end_idx = start_idx + n - 1
 
         rng = random.Random(seed + start_idx)
@@ -236,86 +239,81 @@ class Command(BaseCommand):
                 transcript: List[Dict] = []
                 turn = 1
 
-                # Turn 1: waiter -> day question
+                # Turn 1
                 waiter_1 = call_agent(
-                    client,
-                    WAITER_SYSTEM,
-                    transcript,
-                    turn_instruction="This turn: step 1 only (welcome + ask about the day). Ask one question.",
+                    client, WAITER_SYSTEM, transcript,
+                    "This turn: step 1 only (welcome + ask about the day)."
                 )
                 SimulatedMessage.objects.create(
-                    conversation=conversation, role="waiter", content=waiter_1, turn_index=turn
+                    conversation=conversation, role="waiter",
+                    content=waiter_1, turn_index=turn
                 )
                 transcript.append({"role": "assistant", "content": waiter_1})
                 turn += 1
 
-                # Turn 2: customer -> day answer
+                # Turn 2
                 customer_1 = call_agent(
-                    client,
-                    customer_system,
-                    transcript,
-                    turn_instruction="Answer naturally in 1-2 sentences about your day.",
+                    client, customer_system, transcript,
+                    "Answer naturally in 1-2 sentences about your day."
                 )
                 SimulatedMessage.objects.create(
-                    conversation=conversation, role="customer", content=customer_1, turn_index=turn
+                    conversation=conversation, role="customer",
+                    content=customer_1, turn_index=turn
                 )
                 transcript.append({"role": "user", "content": customer_1})
                 customer.day_summary = customer_1[:5000]
                 turn += 1
 
-                # Turn 3: waiter -> foods question
+                # Turn 3
                 waiter_2 = call_agent(
-                    client,
-                    WAITER_SYSTEM,
-                    transcript,
-                    turn_instruction="This turn: step 2 only (ask top 3 favourite foods). Ask one question.",
+                    client, WAITER_SYSTEM, transcript,
+                    "This turn: step 2 only (ask top 3 favourite foods)."
                 )
                 SimulatedMessage.objects.create(
-                    conversation=conversation, role="waiter", content=waiter_2, turn_index=turn
+                    conversation=conversation, role="waiter",
+                    content=waiter_2, turn_index=turn
                 )
                 transcript.append({"role": "assistant", "content": waiter_2})
                 turn += 1
 
-                # Turn 4: customer -> foods answer (natural)
+                # Turn 4
                 customer_2 = call_agent(
-                    client,
-                    customer_system,
-                    transcript,
-                    turn_instruction="Answer with your top 3 favourite foods (three items) in a natural way.",
+                    client, customer_system, transcript,
+                    "Answer with your top 3 favourite foods in a natural way."
                 )
                 SimulatedMessage.objects.create(
-                    conversation=conversation, role="customer", content=customer_2, turn_index=turn
+                    conversation=conversation, role="customer",
+                    content=customer_2, turn_index=turn
                 )
                 transcript.append({"role": "user", "content": customer_2})
                 turn += 1
 
                 foods = parse_three_foods_natural(customer_2)
+
                 customer.favorite_foods = foods
                 customer.dietary_label = target_label
                 customer.save(update_fields=["day_summary", "favorite_foods", "dietary_label"])
 
-                # Turn 5: waiter -> order question
+                # Turn 5
                 waiter_3 = call_agent(
-                    client,
-                    WAITER_SYSTEM,
-                    transcript,
-                    turn_instruction="This turn: step 3 only (ask what they want to order). Ask one question.",
+                    client, WAITER_SYSTEM, transcript,
+                    "This turn: step 3 only (ask what they want to order)."
                 )
                 SimulatedMessage.objects.create(
-                    conversation=conversation, role="waiter", content=waiter_3, turn_index=turn
+                    conversation=conversation, role="waiter",
+                    content=waiter_3, turn_index=turn
                 )
                 transcript.append({"role": "assistant", "content": waiter_3})
                 turn += 1
 
-                # Turn 6: customer -> order answer
+                # Turn 6
                 customer_3 = call_agent(
-                    client,
-                    customer_system,
-                    transcript,
-                    turn_instruction="Answer what you would order today, consistent with your dietary label.",
+                    client, customer_system, transcript,
+                    "Answer what you would order today."
                 )
                 SimulatedMessage.objects.create(
-                    conversation=conversation, role="customer", content=customer_3, turn_index=turn
+                    conversation=conversation, role="customer",
+                    content=customer_3, turn_index=turn
                 )
 
                 conversation.ordered_dishes = [{"raw_order_text": customer_3}]
