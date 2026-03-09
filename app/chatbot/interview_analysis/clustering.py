@@ -10,7 +10,7 @@ from .extraction import IssueRecord
 # kNN graph construction
 #
 # TODO: _topk_neighbors_for_index is O(n) per call, making the full graph
-# O(n²).  Beyond ~2,000 vectors consider numpy dot-product or faiss.
+# O(n²).
 # ---------------------------------------------------------------------------
 def _topk_neighbors_for_index(
     vectors: List[List[float]],
@@ -135,7 +135,7 @@ def reciprocal_knn_community_cluster_cosine(
 
 
 # ---------------------------------------------------------------------------
-# Deduplication — embedding-based with Jaccard fallback
+# Deduplication — embedding-based with fallback
 # ---------------------------------------------------------------------------
 def deduplicate_issue_records(
     issues: List[IssueRecord],
