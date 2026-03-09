@@ -32,7 +32,7 @@ MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
 
 
 # -----------------------------------------------------------------------------
-# OpenAI call helper (YOU WERE MISSING THIS)
+# OpenAI call helper 
 # -----------------------------------------------------------------------------
 def call_agent(client: OpenAI, system: str, transcript: List[Dict], turn_instruction: str = "") -> str:
     conv_text = ""
